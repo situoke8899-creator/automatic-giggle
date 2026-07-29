@@ -145,6 +145,363 @@ function consensus(ranking){
   return {picks:stats.slice(0,9).map(x=>x.z),stats}
 }
 
+
+const HEAD_PRIOR = {
+  // 01-09 共9个号码；10-19、20-29、30-39、40-49 各10个号码
+  0: 9 / 49,
+  1: 10 / 49,
+  2: 10 / 49,
+  3: 10 / 49,
+  4: 10 / 49,
+}
+
+// 头数最合理的目标不是“选四个热头”，而是：
+// 先估计下一期 0~4 头各自概率，再排除估计概率最低的1个头。
+// 这样每套方案始终覆盖4个头，同时能正确考虑 0头只有9个号码这一结构差异。
+const HEAD_FORMULAS = [
+  {id:'h1', name:'方案1', model:'bayes', label:'贝叶斯稳健', desc:'20/50/100期 + 理论先验收缩，防止小样本过拟合'},
+  {id:'h2', name:'方案2', model:'ewma', label:'近期指数', desc:'越近的开奖权重越高，同时保留理论基础概率'},
+  {id:'h3', name:'方案3', model:'multi', label:'多周期共识', desc:'10/20/30/50/100期同时评分，寻找跨周期最低头'},
+  {id:'h4', name:'方案4', model:'momentum', label:'冷势动量', desc:'比较近10期与近30/50期，排除近期持续走弱头'},
+  {id:'h5', name:'方案5', model:'transition1', label:'一阶转移', desc:'根据上一期开奖头，统计历史上下一期最少出现的头'},
+  {id:'h6', name:'方案6', model:'transition2', label:'二阶转移', desc:'结合最近2期头数状态；样本不足时自动回退稳健模型'},
+  {id:'h7', name:'方案7', model:'gap', label:'遗漏校准', desc:'频率 + 当前遗漏，但对超长遗漏做收缩，不追“必回补”'},
+  {id:'h8', name:'方案8', model:'stability', label:'低波动稳定', desc:'寻找多个窗口都偏低的头，降低单一窗口偶然性'},
+  {id:'h9', name:'方案9', model:'validation', label:'滚动验证', desc:'从基础模型中选最近历史滚动回测表现更稳的排除头'},
+  {id:'h10', name:'方案10', model:'ensemble', label:'多模型共识', desc:'综合前9套模型投票与置信权重，给最终4头'},
+]
+
+function getHead(n){
+  const v = Number(n)
+  return v >= 1 && v <= 49 ? Math.floor(v / 10) : -1
+}
+
+function normalizeHeadProb(scores){
+  const safe = scores.map((v,h)=>Math.max(0.0001, Number(v || 0)))
+  const total = safe.reduce((a,b)=>a+b,0) || 1
+  return safe.map(v=>v/total)
+}
+
+function headCounts(history, size){
+  const src = history.slice(0, size)
+  const counts = [0,0,0,0,0]
+  for(const d of src){
+    const h = getHead(d.specialNumber)
+    if(h >= 0) counts[h]++
+  }
+  return {src, counts}
+}
+
+function empiricalProb(history, size, priorStrength = 12){
+  const {src, counts} = headCounts(history, size)
+  const n = src.length
+  return counts.map((c,h)=>
+    (c + priorStrength * HEAD_PRIOR[h]) / Math.max(1, n + priorStrength)
+  )
+}
+
+function weightedRecentProb(history, decay = 0.92, priorStrength = 8){
+  const score = [0,0,0,0,0]
+  let totalWeight = 0
+
+  history.slice(0,60).forEach((d,i)=>{
+    const h = getHead(d.specialNumber)
+    if(h < 0) return
+    const w = Math.pow(decay, i)
+    score[h] += w
+    totalWeight += w
+  })
+
+  return normalizeHeadProb(score.map((v,h)=>v + priorStrength * HEAD_PRIOR[h]))
+}
+
+function multiWindowProb(history){
+  const windows = [
+    [10,.18],
+    [20,.24],
+    [30,.22],
+    [50,.20],
+    [100,.16],
+  ]
+  const total = [0,0,0,0,0]
+
+  windows.forEach(([size,w])=>{
+    const p = empiricalProb(history,size,10)
+    p.forEach((v,h)=>{ total[h] += v*w })
+  })
+
+  return normalizeHeadProb(total)
+}
+
+function momentumProb(history){
+  const p10 = empiricalProb(history,10,8)
+  const p30 = empiricalProb(history,30,12)
+  const p50 = empiricalProb(history,50,16)
+
+  return normalizeHeadProb(p10.map((_,h)=>{
+    const momentum = p10[h] - p30[h]
+    return p30[h]*.45 + p50[h]*.30 + p10[h]*.25 + momentum*.18
+  }))
+}
+
+function transitionProb(history, order = 1){
+  if(history.length < 25) return empiricalProb(history,50,16)
+
+  const heads = history.map(d=>getHead(d.specialNumber)).filter(h=>h>=0)
+  if(heads.length < 20) return empiricalProb(history,50,16)
+
+  // history 是最新在前。为了按时间正序统计转移，先反转。
+  const chronological = [...heads].reverse()
+  const currentState = heads.slice(0,order).reverse()
+  const counts = [0,0,0,0,0]
+  let matches = 0
+
+  for(let i=order;i<chronological.length;i++){
+    const prev = chronological.slice(i-order,i)
+    let same = true
+    for(let j=0;j<order;j++){
+      if(prev[j] !== currentState[j]) { same=false; break }
+    }
+    if(!same) continue
+
+    const next = chronological[i]
+    if(next >= 0){
+      counts[next]++
+      matches++
+    }
+  }
+
+  // 二阶样本很容易过少：自动回退一阶/贝叶斯。
+  if(matches < (order === 2 ? 5 : 8)){
+    return order === 2 ? transitionProb(history,1) : empiricalProb(history,50,16)
+  }
+
+  const priorStrength = order === 2 ? 10 : 8
+  return normalizeHeadProb(counts.map((c,h)=>c + priorStrength*HEAD_PRIOR[h]))
+}
+
+function gapAdjustedProb(history){
+  const base = multiWindowProb(history)
+  const omit = [history.length,history.length,history.length,history.length,history.length]
+
+  history.forEach((d,i)=>{
+    const h=getHead(d.specialNumber)
+    if(h>=0 && omit[h]===history.length) omit[h]=i
+  })
+
+  // 不使用“越久没出越该出”的赌徒谬误。
+  // 只对极端遗漏做非常轻微回归均值调整，主要信号仍来自频率。
+  return normalizeHeadProb(base.map((p,h)=>{
+    const gap = Math.min(15, omit[h])
+    const meanReversion = (HEAD_PRIOR[h] - p) * Math.min(.18, gap*.012)
+    return p + meanReversion
+  }))
+}
+
+function stabilityProb(history){
+  const windows=[20,30,50,100]
+  const ps=windows.map(w=>empiricalProb(history,w,12))
+  return normalizeHeadProb([0,1,2,3,4].map(h=>{
+    const vals=ps.map(p=>p[h])
+    const avg=vals.reduce((a,b)=>a+b,0)/vals.length
+    const variance=vals.reduce((s,v)=>s+(v-avg)**2,0)/vals.length
+    // 对波动大的估计向理论概率收缩
+    const shrink=Math.min(.45, Math.sqrt(variance)*5)
+    return avg*(1-shrink)+HEAD_PRIOR[h]*shrink
+  }))
+}
+
+function picksFromProb(prob){
+  let exclude = 0
+  for(let h=1;h<5;h++){
+    if(prob[h] < prob[exclude]) exclude = h
+  }
+  return {
+    exclude,
+    picks:[0,1,2,3,4].filter(h=>h!==exclude),
+    prob,
+    confidence: Math.max(0, Math.min(1,
+      (Math.min(...prob.filter((_,h)=>h!==exclude)) - prob[exclude]) * 5
+    )),
+  }
+}
+
+function baseModelResult(history, model){
+  if(model==='bayes'){
+    const p20=empiricalProb(history,20,14)
+    const p50=empiricalProb(history,50,18)
+    const p100=empiricalProb(history,100,24)
+    return picksFromProb(normalizeHeadProb(p20.map((_,h)=>p20[h]*.40+p50[h]*.35+p100[h]*.25)))
+  }
+  if(model==='ewma') return picksFromProb(weightedRecentProb(history,.93,10))
+  if(model==='multi') return picksFromProb(multiWindowProb(history))
+  if(model==='momentum') return picksFromProb(momentumProb(history))
+  if(model==='transition1') return picksFromProb(transitionProb(history,1))
+  if(model==='transition2') return picksFromProb(transitionProb(history,2))
+  if(model==='gap') return picksFromProb(gapAdjustedProb(history))
+  if(model==='stability') return picksFromProb(stabilityProb(history))
+  return picksFromProb(empiricalProb(history,50,16))
+}
+
+function quickModelHitRate(history, model, size=40){
+  let hit=0,tested=0
+  for(let i=0;i<Math.min(size,history.length);i++){
+    const past=history.slice(i+1)
+    if(past.length<20) continue
+    const result=baseModelResult(past,model)
+    const actual=getHead(history[i].specialNumber)
+    if(actual<0) continue
+    tested++
+    if(result.picks.includes(actual)) hit++
+  }
+  return tested ? hit/tested : 0
+}
+
+function validationResult(history){
+  const candidates=['bayes','ewma','multi','momentum','transition1','gap','stability']
+  const ranked=candidates
+    .map(model=>({model,rate:quickModelHitRate(history,model,40)}))
+    .sort((a,b)=>b.rate-a.rate)
+
+  return baseModelResult(history, ranked[0]?.model || 'bayes')
+}
+
+function allHeadResults(history){
+  const results=[]
+
+  for(const f of HEAD_FORMULAS){
+    if(f.model==='validation'){
+      results.push(validationResult(history))
+      continue
+    }
+
+    if(f.model==='ensemble'){
+      // 综合前9套：被更多模型判定为“应排除”的头，排除票更高。
+      const vote=[0,0,0,0,0]
+      results.forEach((r)=>{
+        vote[r.exclude] += 1 + (r.confidence || 0)
+      })
+
+      // 理论上0头只有9个号码，若票数接近，优先排除0头。
+      vote[0] += .12
+
+      let exclude=0
+      for(let h=1;h<5;h++){
+        if(vote[h] > vote[exclude]) exclude=h
+      }
+
+      const pseudoProb=normalizeHeadProb(
+        vote.map((v,h)=>1/Math.max(.15, v+.3) + HEAD_PRIOR[h]*.15)
+      )
+
+      results.push({
+        exclude,
+        picks:[0,1,2,3,4].filter(h=>h!==exclude),
+        prob:pseudoProb,
+        confidence: Math.min(1, (vote[exclude]-[...vote].sort((a,b)=>b-a)[1])*.25),
+      })
+      continue
+    }
+
+    results.push(baseModelResult(history,f.model))
+  }
+
+  return results
+}
+
+function backtestHead(history, formulaIndex, size){
+  const rows=[]
+  const limit=Math.min(size,history.length)
+
+  for(let i=0;i<limit;i++){
+    const past=history.slice(i+1)
+    if(past.length<20) continue
+
+    const results=allHeadResults(past)
+    const result=results[formulaIndex]
+    const actual=getHead(history[i].specialNumber)
+
+    if(actual<0) continue
+
+    rows.push({
+      expect:history[i].expect,
+      actual,
+      exclude:result.exclude,
+      picks:result.picks,
+      hit:result.picks.includes(actual),
+    })
+  }
+
+  const rs=rows.map(x=>x.hit)
+  const hitCount=rows.filter(x=>x.hit).length
+
+  return {
+    rows,
+    testedCount:rows.length,
+    hitCount,
+    hitRate:rows.length ? hitCount/rows.length*100 : 0,
+    maxMiss:maxMiss(rs),
+    currentMiss:currentMiss(rs),
+  }
+}
+
+function buildHeadRanking(history){
+  const current=allHeadResults(history)
+
+  return HEAD_FORMULAS.map((f,i)=>{
+    const r20=backtestHead(history,i,20)
+    const r30=backtestHead(history,i,30)
+    const r50=backtestHead(history,i,50)
+    const r100=backtestHead(history,i,100)
+
+    // 排名优先近期，但要求长样本不能太差；连错会扣分。
+    const score=
+      r20.hitRate*.38 +
+      r30.hitRate*.27 +
+      r50.hitRate*.20 +
+      r100.hitRate*.15 -
+      r20.maxMiss*1.25
+
+    return {
+      ...f,
+      ...current[i],
+      r20,r30,r50,r100,
+      score:Number(score.toFixed(2)),
+    }
+  }).sort((a,b)=>
+    b.score-a.score ||
+    b.r20.hitRate-a.r20.hitRate ||
+    b.r50.hitRate-a.r50.hitRate ||
+    a.r20.maxMiss-b.r20.maxMiss
+  )
+}
+
+function headConsensus(ranking){
+  // 不是简单数“4头出现次数”，直接统计每套公式想排除哪个头。
+  const excludeVotes=[0,0,0,0,0]
+
+  ranking.forEach((s,i)=>{
+    const rankWeight=10-i
+    excludeVotes[s.exclude] += rankWeight * (1 + (s.confidence||0)*.35)
+  })
+
+  // 0头只覆盖9个号码，长期理论概率稍低，因此平票时略优先排除0头。
+  excludeVotes[0] += .5
+
+  let exclude=0
+  for(let h=1;h<5;h++){
+    if(excludeVotes[h] > excludeVotes[exclude]) exclude=h
+  }
+
+  return {
+    exclude,
+    picks:[0,1,2,3,4].filter(h=>h!==exclude),
+    votes:excludeVotes,
+  }
+}
+
+function H({h}){ return <span className="h">{h}头</span> }
+
 function Z({z}){ return <span className="z">{z}</span> }
 function Ball({n,z,special=false}){ return <div className="bw"><span className={special?'ball sp':'ball'}>{String(n).padStart(2,'0')}</span><small>{z||'-'}</small></div> }
 
@@ -153,6 +510,7 @@ export default function Page(){
   const [error,setError]=useState('')
   const [loading,setLoading]=useState(true)
   const [copied,setCopied]=useState(false)
+  const [headCopied,setHeadCopied]=useState(false)
 
   async function load(){
     setLoading(true);setError('')
@@ -170,11 +528,18 @@ export default function Page(){
   const history=data?.history||[]
   const ranking=useMemo(()=>buildRanking(history),[history])
   const con=useMemo(()=>consensus(ranking),[ranking])
+  const hRanking=useMemo(()=>buildHeadRanking(history),[history])
+  const hCon=useMemo(()=>headConsensus(hRanking),[hRanking])
   const latest=data?.latest
 
   async function copy(){
     const txt=`第${data?.nextExpect||'-'}期综合9生肖：${con.picks.join(' ')}`
     try{await navigator.clipboard.writeText(txt);setCopied(true);setTimeout(()=>setCopied(false),1200)}catch{alert(txt)}
+  }
+
+  async function copyHeads(){
+    const txt=`第${data?.nextExpect||'-'}期综合4头：${hCon.picks.map(h=>`${h}头`).join(' ')}｜排除：${hCon.exclude}头`
+    try{await navigator.clipboard.writeText(txt);setHeadCopied(true);setTimeout(()=>setHeadCopied(false),1200)}catch{alert(txt)}
   }
 
   return <main className="page">
@@ -184,7 +549,7 @@ export default function Page(){
       .wrap{max-width:1450px;margin:auto}.card{background:#0e1c31;border:1px solid #263a55;border-radius:16px;padding:18px;margin-bottom:18px}
       h1,h2{margin:0 0 10px}.muted,.sub{color:#9db1ca}.hero{display:grid;grid-template-columns:1.25fr .75fr;gap:16px}
       .cons{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-top:16px;padding:14px;border-radius:13px;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.25)}
-      .zlist{display:flex;flex-wrap:wrap;gap:6px}.z{display:inline-flex;min-width:34px;height:31px;padding:0 8px;align-items:center;justify-content:center;border-radius:9px;background:#22c55e;color:#052e16;border:1px solid #86efac;font-weight:900}
+      .zlist,.hlist{display:flex;flex-wrap:wrap;gap:6px}.z{display:inline-flex;min-width:34px;height:31px;padding:0 8px;align-items:center;justify-content:center;border-radius:9px;background:#22c55e;color:#052e16;border:1px solid #86efac;font-weight:900}.h{display:inline-flex;min-width:48px;height:31px;padding:0 8px;align-items:center;justify-content:center;border-radius:9px;background:#38bdf8;color:#082f49;border:1px solid #7dd3fc;font-weight:900}
       button{border:0;border-radius:10px;background:#38bdf8;color:#062238;font-weight:900;padding:10px 14px;cursor:pointer}.copy{background:linear-gradient(145deg,#fde047,#f97316)}
       .balls{display:flex;gap:7px;flex-wrap:wrap;align-items:flex-start}.bw{text-align:center}.ball{width:42px;height:42px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#e2e8f0;color:#0f172a;font-weight:900}.sp{background:linear-gradient(145deg,#fde047,#f97316)}.bw small{display:block;margin-top:4px}
       .toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:16px 0}.error{padding:13px;background:rgba(239,68,68,.14);border:1px solid #7f1d1d;border-radius:10px;color:#fecaca}
@@ -249,6 +614,46 @@ export default function Page(){
       </section>
 
       <section className="card">
+        <div className="cons" style={{marginTop:0,marginBottom:14}}>
+          <div>
+            <h2 style={{marginBottom:8}}>头数预测｜10个优选方案</h2>
+            <div className="muted">下一期综合4头｜第 {data?.nextExpect||'-'} 期｜综合排除 <strong style={{color:'#fb7185'}}>{hCon.exclude}头</strong></div>
+            <div className="hlist" style={{marginTop:10}}>{hCon.picks.map(h=><H key={h} h={h}/>)}</div>
+          </div>
+          <button className="copy" onClick={copyHeads}>{headCopied?'已复制':'复制综合4头'}</button>
+        </div>
+
+        <p className="sub">优化逻辑：不再简单用“4热/3热+1冷”。每套模型先估计下一期 0–4头的相对概率，再排除概率最低的1个头，保留另外4头。特别考虑0头只有01–09共9个号码，而1–4头各有10个号码，避免把五个头错误当成完全等概率。</p>
+
+        <div className="scroll"><table>
+          <thead><tr><th>排名</th><th>方案</th><th>模型逻辑</th><th>下期4头</th><th>排除头</th><th>近20</th><th>近30</th><th>近50</th><th>近100</th><th>最大连错</th><th>最近20期走势</th></tr></thead>
+          <tbody>{hRanking.map((s,i)=><tr key={s.id}>
+            <td className="rank">{i+1}</td>
+            <td><strong>{s.name}</strong></td>
+            <td className="formula"><strong>{s.label}</strong><div className="muted">{s.desc}</div></td>
+            <td><div className="hlist">{s.picks.map(h=><H key={h} h={h}/>)}</div></td>
+            <td><strong style={{color:'#fb7185'}}>{s.exclude}头</strong><div className="muted">置信差 {((s.confidence||0)*100).toFixed(1)}%</div></td>
+            <td><span className={s.r20.hitRate>=82?'rate good':s.r20.hitRate>=78?'rate mid':'rate low'}>{pct(s.r20.hitRate)}</span><div className="muted">{s.r20.hitCount}/{s.r20.testedCount}</div></td>
+            <td><span className="rate">{pct(s.r30.hitRate)}</span><div className="muted">{s.r30.hitCount}/{s.r30.testedCount}</div></td>
+            <td><span className="rate">{pct(s.r50.hitRate)}</span><div className="muted">{s.r50.hitCount}/{s.r50.testedCount}</div></td>
+            <td><span className="rate">{pct(s.r100.hitRate)}</span><div className="muted">{s.r100.hitCount}/{s.r100.testedCount}</div></td>
+            <td>{s.r50.maxMiss}<div className="muted">当前 {s.r20.currentMiss}</div></td>
+            <td><div className="dots">{s.r20.rows.slice().reverse().map(r=><span key={r.expect} className={r.hit?'dot hit':'dot'} title={`第${r.expect}期｜${r.actual}头｜${r.hit?'中':'未中'}`}/>)}</div></td>
+          </tr>)}</tbody>
+        </table></div>
+      </section>
+
+      <section className="card">
+        <h2>头数优化说明</h2>
+        <div className="note">
+          <strong>核心改变：</strong>4头方案本质上等于“从0–4头里排除1个头”。因此新版10套模型都直接预测“下一期最应该排除哪个头”，而不是把4个头独立选出来。
+          其中0头只有01–09共9个号码，理论基础概率是9/49；其余1–4头各有10个号码，理论基础概率各为10/49。
+          模型会用最近100期做贝叶斯收缩、指数近期权重、多周期共识、动量、历史转移、遗漏校准、稳定性和滚动验证，再动态排名。
+          这比单纯“热头/冷头”更不容易被短期噪声带偏。
+        </div>
+      </section>
+
+      <section className="card">
         <h2>为什么旧版会出现50%左右</h2>
         <div className="note">
           macaujc.com 的 API 示例生肖使用繁体字，例如「馬、龍、雞、豬」。旧版预测列表使用「马、龙、鸡、猪」。
@@ -267,7 +672,7 @@ export default function Page(){
       </section>
 
       <section className="card">
-        <p className="sub">说明：9生肖相当于覆盖12生肖中的9个，理论覆盖率为75%。任何公式都不能保证未来高于75%；本页面的作用是避免数据错误、比较不同历史模型，并用严格的滚动回测减少“看了答案再选”的偏差。</p>
+        <p className="sub">说明：9生肖相当于覆盖12生肖中的9个，理论覆盖率为75%。头数方案固定覆盖5个头中的4个。所有历史命中率都采用逐期滚动回测，仅用于比较历史表现，不保证未来结果。</p>
       </section>
     </div>
   </main>
